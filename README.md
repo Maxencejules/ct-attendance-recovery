@@ -319,6 +319,12 @@ CSV rerun check. CI uploads the reports and proof. Historical results above
 remain same-year district results; compare them separately with time-held-out
 metrics, which can be worse than persistence.
 
+The original retrospective GroupKFold can assign equal-size districts differently
+across platforms even with the locked libraries. The native Windows and Ubuntu
+artifacts record their actual fold identities and metrics: ridge MAE was 0.7646
+and 0.7470 pp respectively. Compare the recorded folds and runtime when reproducing
+that estimate. The new time-holdout metrics below agree across both platforms.
+
 On the unchanged snapshot with the locked Python 3.12 environment, the
 two-year-history backtest trains on target 2021-2022 and evaluates target
 2022-2023: 1,943 scored rows, with all training cutoffs strictly earlier.
