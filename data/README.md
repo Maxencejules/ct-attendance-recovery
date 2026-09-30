@@ -18,6 +18,8 @@
 
 The file is committed exactly as downloaded (the SHA256 above is of the
 committed file).
+`.gitattributes` preserves CSV bytes without Windows line-ending conversion;
+the native proof checks this exact checksum before reading the snapshot.
 
 **Suggested citation:** Connecticut State Department of Education. *School
 Attendance by Student Group and District, 2022-2023* (dataset he4h-bgqh).

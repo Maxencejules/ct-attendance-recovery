@@ -2,7 +2,7 @@
 
 A small Python command-line tool for the Connecticut State Department of
 Education's public "School Attendance by Student Group and District" data.
-It does two things:
+It provides three distinct evaluations:
 
 1. **`analyze`**: computes a student-weighted attendance rate for each
    student group in each school year, combining district rows. It then
@@ -11,6 +11,12 @@ It does two things:
    rate in the latest year from the same row's earlier years. It compares
    ridge regression and histogram gradient boosting with a persistence
    baseline (last year's rate) using cross-validation grouped by district.
+   This is retrospective same-year validation: the fold's training districts
+   already have observed outcomes in the target year.
+3. **`backtest`**: holds out each eligible later year, fitting only strictly
+   earlier target years with a fixed history window. It evaluates transfer
+   across time for observed districts; it does not use the held-out year's
+   rates or student counts to produce its predictions.
 
 The data file, `data/school_attendance_by_student_group_and_district_2022-2023.csv`
 (dataset `he4h-bgqh`, Public Domain), is included. See [Data](#data).
@@ -25,11 +31,12 @@ The data file, `data/school_attendance_by_student_group_and_district_2022-2023.c
 Install the dependencies in whatever environment you use, for example:
 
 ```
-python -m pip install -r requirements.txt
+python -m pip install -r requirements-lock.txt
 ```
 
-This code was run and tested in an environment that already had those
-versions installed. The package is not installed itself. Run it from the
+The complete Python 3.12 verification environment is pinned in
+`requirements-lock.txt`; `requirements.txt` retains library minimums.
+The package is not installed itself. Run it from the
 repository root with `src` on `PYTHONPATH`.
 
 ## Usage
@@ -40,6 +47,10 @@ PYTHONPATH=src python -m attendance_recovery analyze \
 
 PYTHONPATH=src python -m attendance_recovery forecast \
     --data data/school_attendance_by_student_group_and_district_2022-2023.csv --out outputs/
+
+PYTHONPATH=src python -m attendance_recovery backtest \
+    --data data/school_attendance_by_student_group_and_district_2022-2023.csv \
+    --history-years 2 --rate-unit fraction --out outputs/backtest/
 ```
 
 Options:
@@ -48,6 +59,16 @@ Options:
   2019-2020 when the file has it, otherwise the oldest year. The baseline
   must be earlier than the latest year in the file; otherwise the command
   prints an `error:` line and exits with status 2 without writing outputs.
+- `--rate-unit auto|percent|fraction` applies to all commands and controls
+  unmarked rate cells. Explicit `%` cells always use percent. Auto retains
+  column inference using valid candidates; outliers above 100 cannot rescale
+  other rows. Mixed unmarked values above and below 1 fail until a unit is
+  selected. An unmarked `0.5` is ambiguous: use `percent` for 0.5% or
+  `fraction` for 50%. Use `fraction` for the included CSDE snapshot.
+- `backtest --history-years N` uses the same N-year lag feature layout at
+  every origin. At least N+2 consecutive school years are required. The
+  default N=2 gives one evaluated origin in the included four-year file;
+  N=1 gives two. Empty origins fail explicitly before output creation.
 - `forecast --folds N` sets the number of GroupKFold folds (default 5).
   `forecast --seed N` is passed as `random_state` to the gradient-boosting
   model (default 0). With the fixed settings used here (no early stopping,
@@ -70,6 +91,9 @@ Both commands print a short summary. They write these files to `--out`
 | `forecast_by_group.csv` | MAE for each student group and forecaster |
 | `forecast_excluded_rows.csv` | Every row left out of the forecast and the reason |
 | `forecast_summary.md` | The forecast setup, exclusions, the metrics tables and a plain comparison with persistence |
+| `backtest_metrics.csv`, `backtest_fold_metrics.csv` | Pooled errors and each origin/model's training years, row counts and errors |
+| `backtest_predictions.csv`, `backtest_by_group.csv` | Time-held-out predictions with training cutoffs and group errors |
+| `backtest_excluded_rows.csv`, `backtest_summary.md` | Exclusions by origin and train/test role, evaluation method and limits |
 
 ## Method
 
@@ -77,11 +101,18 @@ Both commands print a short summary. They write these files to `--out`
 - The loader finds the school-year columns by header (`<yyyy>-<yyyy> student
   count` / `attendance rate`), so the files for other years parse too.
 - District codes are read as text, which keeps their leading zeros.
-- Rates given as percentages are converted to fractions.
+- Rates given as percentages are converted to fractions, preserving explicit
+  percent markers even when a column contains only small percentages.
+- Duplicate canonical headers, missing count/rate column pairs, malformed or
+  nonconsecutive years, blank district/group IDs and conflicting observations
+  fail explicitly. Only identical normalized observations are deduplicated;
+  differing reporting periods are conflicts.
 - Blank cells, `*` and any other non-numeric text count as suppressed. Each
   one is tallied by token.
 - If only one of a year's count and rate is present, both are cleared.
   Out-of-range values are cleared too.
+- Negative or fractional counts are invalid. For backtest scoring, an observed
+  target rate is retained without its target count; lagged counts remain required.
 - The statewide row (district code `00000CT`) is flagged.
 
 **Descriptive analysis** (`trends.py`)
@@ -117,6 +148,19 @@ Both commands print a short summary. They write these files to `--out`
 - Validation: `GroupKFold` keyed on district code. The code checks every fold
   and raises an error if any district appears in both train and test. MAE
   and RMSE are pooled over all out-of-fold predictions.
+
+**Time-held-out evaluation** (`backtesting.py`)
+- Each test target is scored once. Training accumulates only windows whose
+  target year is strictly earlier, and preprocessing is refitted on those rows.
+- Generic lag features keep the same meaning across origins; the four existing
+  forecasters and fixed hyperparameters are reused. The drift reference is
+  learned from past changes, so a shock in the held-out year cannot be learned
+  from that year's labels.
+- Same districts may recur across years. This is a different question from
+  same-year validation on unseen districts. Neither mode establishes causal
+  explanations or performance in an unobserved future year.
+- Errors weight district/group rows equally. Student groups overlap and
+  repeated yearly observations are dependent; no confidence interval is implied.
 
 ## Results on the included data
 
@@ -258,6 +302,46 @@ run time. They do not use the network. They cover:
 
 Result on 2026-09-23, with the same interpreter and library versions as
 above: `Ran 43 tests ... OK`.
+
+The expanded suite also tests canonical-header and duplicate integrity,
+explicit rate units, future/current-label perturbations, a held-out 20-point
+shock, hand-calculated temporal errors and end-to-end target-count independence.
+Native CI runs the complete suite on Ubuntu and Windows, followed by all three
+commands on the unchanged public snapshot. Reproduce the evidence locally:
+
+```
+OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 python ci/prove_attendance.py
+```
+
+`outputs/ci-proof/proof.json` records dataset/source/output SHA256 values,
+runtime versions, measured metrics, explicit training cutoffs and an identical
+CSV rerun check. CI uploads the reports and proof. Historical results above
+remain same-year district results; compare them separately with time-held-out
+metrics, which can be worse than persistence.
+
+The original retrospective GroupKFold can assign equal-size districts differently
+across platforms even with the locked libraries. The native Windows and Ubuntu
+artifacts record their actual fold identities and metrics: ridge MAE was 0.7646
+and 0.7470 pp respectively. Compare the recorded folds and runtime when reproducing
+that estimate. The new time-holdout metrics below agree across both platforms.
+
+On the unchanged snapshot with the locked Python 3.12 environment, the
+two-year-history backtest trains on target 2021-2022 and evaluates target
+2022-2023: 1,943 scored rows, with all training cutoffs strictly earlier.
+The latest count is not required for scoring. A second run produces identical
+CSV files. Measured percentage-point errors are:
+
+| Forecaster | Time-held-out MAE | Time-held-out RMSE |
+| --- | ---: | ---: |
+| Persistence | 1.0118 | 1.4214 |
+| Persistence + mean historical change | 1.5135 | 1.9570 |
+| Ridge | 1.6593 | 2.2411 |
+| Histogram gradient boosting | 1.7015 | 2.1524 |
+
+Persistence wins this time holdout. The same-year ridge advantage above
+cannot establish a future-year advantage. One origin supplies no meaningful
+cross-origin standard deviation; the metrics CSV leaves it empty. Native CI
+recomputes the evidence rather than trusting this table.
 
 ## Layout
 

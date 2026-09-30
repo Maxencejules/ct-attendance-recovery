@@ -136,7 +136,7 @@ def forecast_markdown(data: AttendanceData, frame: ModelFrame, result: ForecastR
     n_districts = frame.rows["district_code"].nunique()
 
     parts = [
-        f"# Forecasting {frame.target_year} attendance rates",
+        f"# Retrospective district validation for {frame.target_year} attendance rates",
         "",
         f"Source file: `{data.report.source}`",
         "",
@@ -153,6 +153,9 @@ def forecast_markdown(data: AttendanceData, frame: ModelFrame, result: ForecastR
         f"- Validation: GroupKFold with {result.n_splits} folds grouped by district code, "
         f"so no district appears in both the training and test part of a fold "
         f"({n_districts} districts, {len(frame.rows)} rows).",
+        "- This is same-year retrospective validation: training uses other districts' "
+        "target-year outcomes. It does not measure future-year prediction. Use the "
+        "`backtest` command for a time-held-out evaluation.",
         "",
         "## Rows excluded",
         "",
@@ -176,3 +179,28 @@ def forecast_markdown(data: AttendanceData, frame: ModelFrame, result: ForecastR
         "",
     ]
     return "\n".join(parts)
+
+
+def backtest_markdown(data, result) -> str:
+    folds = result.fold_metrics
+    return "\n".join([
+        "# Time-held-out attendance backtest", "",
+        f"Source file: `{data.report.source}`", "",
+        f"- Fixed feature window: {result.history_years} prior school years; {result.n_origins} evaluated origins.",
+        "- Each origin fits preprocessing and all models only on strictly earlier target years. "
+        "The current target's outcomes and student counts never enter its predictions.",
+        "- Districts may recur across years. This measures transfer across time for observed "
+        "districts, separately from the district holdout used by `forecast`.",
+        "- Hyperparameters are fixed. Complete prior-window counts/rates and an observed target "
+        "rate are required for scoring; the exclusion file audits omitted rows per origin and role.",
+        "- Errors are unweighted district/group percentage-point errors, pooled across origins. "
+        "Groups overlap and repeated yearly observations are dependent; no confidence or causal claim follows.",
+        "", "## Pooled error", "", markdown_table(result.metrics, digits=3),
+        "", "## Origin and model results", "", markdown_table(folds, digits=3),
+        "", "## MAE by student group", "", markdown_table(result.by_group, digits=3),
+        "", "## Limits", "",
+        "The included four-year snapshot supplies only one two-history-year time holdout. "
+        "Earlier years span COVID disruptions and the latest year is year to date. "
+        "A time holdout cannot establish performance in unobserved future years or explain "
+        "changes for individual students. No model is promoted automatically.", "",
+    ])

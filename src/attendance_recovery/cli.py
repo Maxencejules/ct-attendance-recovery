@@ -30,7 +30,7 @@ def run_analyze(args: argparse.Namespace) -> int:
     from .reports import analysis_markdown
     from .trends import group_trajectories, recovery_gaps
 
-    data = load_attendance(args.data)
+    data = load_attendance(args.data, rate_unit=getattr(args, "rate_unit", "auto"))
     trajectories = group_trajectories(data)
     gaps = recovery_gaps(data, args.baseline)
     out: Path = args.out
@@ -63,7 +63,7 @@ def run_forecast(args: argparse.Namespace) -> int:
     from .forecasting import MODEL_LABELS, build_model_frame, comparison_sentences, cross_validate
     from .reports import forecast_markdown
 
-    data = load_attendance(args.data)
+    data = load_attendance(args.data, rate_unit=getattr(args, "rate_unit", "auto"))
     frame = build_model_frame(data)
     result = cross_validate(frame, n_splits=args.folds, random_state=args.seed)
     out: Path = args.out
@@ -83,12 +83,38 @@ def run_forecast(args: argparse.Namespace) -> int:
     for reason, n in frame.exclusions["reason"].value_counts().items():
         print(f"  {n:5d}  {reason}")
     print(f"GroupKFold by district, {args.folds} folds (no district in both train and test)")
+    print("Retrospective same-year district validation; training uses other districts' target-year outcomes.")
     print(f"{'forecaster':38s} {'MAE pp':>8s} {'RMSE pp':>8s}")
     for row in result.metrics.itertuples():
         print(f"{MODEL_LABELS[row.model]:38s} {row.mae_pp:8.3f} {row.rmse_pp:8.3f}")
     for line in comparison_sentences(result.metrics, result.n_splits):
         print(line)
     print(f"Wrote forecast_*.csv and forecast_summary.md to {out}")
+    return 0
+
+
+def run_backtest(args: argparse.Namespace) -> int:
+    from .backtesting import expanding_origin_backtest
+    from .reports import backtest_markdown
+
+    data = load_attendance(args.data, rate_unit=args.rate_unit, require_paired=False)
+    result = expanding_origin_backtest(data, history_years=args.history_years, random_state=args.seed)
+    out: Path = args.out
+    out.mkdir(parents=True, exist_ok=True)
+    tables = {
+        "backtest_metrics.csv": result.metrics,
+        "backtest_fold_metrics.csv": result.fold_metrics,
+        "backtest_predictions.csv": result.predictions,
+        "backtest_by_group.csv": result.by_group,
+        "backtest_excluded_rows.csv": result.exclusions,
+    }
+    for name, table in tables.items():
+        table.to_csv(out / name, index=False, float_format="%.4f")
+    _write(out / "backtest_summary.md", backtest_markdown(data, result))
+    print(f"Expanding-origin backtest: {result.n_origins} time-held-out year(s), {result.history_years} prior years per row")
+    for row in result.metrics.itertuples():
+        print(f"{row.model}: MAE {row.mae_pp:.3f} pp; RMSE {row.rmse_pp:.3f} pp")
+    print(f"Wrote backtest_*.csv and backtest_summary.md to {out}")
     return 0
 
 
@@ -117,6 +143,15 @@ def build_parser() -> argparse.ArgumentParser:
         "used here the model has no random step, so this does not change the results",
     )
     forecast.set_defaults(func=run_forecast)
+    backtest = sub.add_parser("backtest", help="time-held-out expanding-origin evaluation")
+    backtest.add_argument("--data", type=Path, required=True, help="attendance CSV downloaded from data.ct.gov")
+    backtest.add_argument("--out", type=Path, required=True, help="directory for CSV and Markdown outputs")
+    backtest.add_argument("--history-years", type=int, default=2, help="fixed prior-year feature window (default 2)")
+    backtest.add_argument("--seed", type=int, default=0, help="gradient boosting random state")
+    backtest.set_defaults(func=run_backtest)
+    for command in (analyze, forecast, backtest):
+        command.add_argument("--rate-unit", choices=("auto", "percent", "fraction"), default="auto",
+                             help="unit of unmarked rate cells; explicit %% cells always use percent")
     return parser
 
 

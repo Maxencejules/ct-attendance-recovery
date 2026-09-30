@@ -41,7 +41,7 @@ _YEAR_HEADER = re.compile(
     re.IGNORECASE,
 )
 # A rate column whose largest value exceeds this is read as a percentage.
-_PERCENT_THRESHOLD = 1.5
+_PERCENT_THRESHOLD = 1.0
 
 
 def count_col(year: str) -> str:
@@ -114,7 +114,12 @@ class AttendanceData:
 
 def _normalise_year(start: str, end: str) -> str:
     if len(end) == 2:
-        end = start[:2] + end
+        number = int(start[:2] + end)
+        if number < int(start):
+            number += 100
+        end = str(number)
+    if int(end) != int(start) + 1:
+        raise ValueError(f"invalid school year {start}-{end}: years must be consecutive")
     return f"{start}-{end}"
 
 
@@ -125,19 +130,28 @@ def _find_columns(columns) -> tuple[dict, dict]:
     for raw in columns:
         key = " ".join(str(raw).strip().lower().split())
         if key in _HEADER_ALIASES:
-            id_map[_HEADER_ALIASES[key]] = raw
+            field_name = _HEADER_ALIASES[key]
+            if field_name in id_map:
+                raise ValueError(f"duplicate column for {field_name}")
+            id_map[field_name] = raw
             continue
         match = _YEAR_HEADER.match(str(raw))
         if match:
             year = _normalise_year(match.group(1), match.group(2))
             kind = "count" if match.group(3).lower() == "student count" else "rate"
+            if (year, kind) in year_map:
+                raise ValueError(f"duplicate column for {year} {kind}")
             year_map[(year, kind)] = raw
+        elif re.search(r"student\s+count|attendance\s+rate", key):
+            raise ValueError(f"invalid school year measurement header: {raw!r}")
     return id_map, year_map
 
 
 def _to_number(raw: pd.Series, label: str, report: LoadReport) -> pd.Series:
     text = raw.fillna("").astype(str).str.strip()
-    cleaned = text.str.replace(",", "", regex=False).str.rstrip("%").str.strip()
+    cleaned = text.str.replace(",", "", regex=False)
+    if "attendance rate" in label:
+        cleaned = cleaned.str.rstrip("%").str.strip()
     values = pd.to_numeric(cleaned, errors="coerce").astype(float)
     values[~np.isfinite(values)] = np.nan
     bad = values.isna()
@@ -146,13 +160,28 @@ def _to_number(raw: pd.Series, label: str, report: LoadReport) -> pd.Series:
     return values
 
 
-def load_attendance(source: Union[str, Path, IO[str]]) -> AttendanceData:
-    """Read and clean an attendance CSV (path or open text stream)."""
+def load_attendance(source: Union[str, Path, IO[str]], *, rate_unit: str = "auto", require_paired: bool = True) -> AttendanceData:
+    """Read observations without choosing silently between conflicting records.
+
+    Explicit percent markers always denote percentages. ``rate_unit`` selects
+    the unit for unmarked cells; auto retains the column inference for valid
+    candidates only. Plain values at or below 1 are inherently ambiguous.
+    ``require_paired=False`` retains an observed rate without its count for
+    time-held-out scoring; history-window counts remain required by backtesting.
+    """
+    if rate_unit not in {"auto", "percent", "fraction"}:
+        raise ValueError("rate_unit must be auto, percent or fraction")
     name = str(source) if isinstance(source, (str, Path)) else getattr(source, "name", "<stream>")
     if isinstance(source, (str, Path)):
-        raw = pd.read_csv(source, dtype=str, keep_default_na=False, encoding="utf-8-sig")
+        raw = pd.read_csv(source, header=None, dtype=str, keep_default_na=False, encoding="utf-8-sig")
     else:
-        raw = pd.read_csv(source, dtype=str, keep_default_na=False)
+        raw = pd.read_csv(source, header=None, dtype=str, keep_default_na=False)
+    if len(raw) < 2:
+        raise ValueError("no attendance observations found")
+    # Read the original header before pandas can mangle duplicate names.
+    headers = raw.iloc[0].tolist()
+    raw = raw.iloc[1:].reset_index(drop=True)
+    raw.columns = headers
     report = LoadReport(source=name, rows_read=len(raw))
 
     id_map, year_map = _find_columns(raw.columns)
@@ -162,6 +191,10 @@ def load_attendance(source: Union[str, Path, IO[str]]) -> AttendanceData:
     years = sorted({y for (y, _k) in year_map if (y, "count") in year_map and (y, "rate") in year_map})
     if not years:
         raise ValueError("no '<yyyy>-<yyyy> student count' / 'attendance rate' column pairs found")
+    if len(year_map) != len(years) * 2:
+        raise ValueError("every school year needs a count/rate column pair")
+    if any(int(b[:4]) != int(a[:4]) + 1 for a, b in zip(years, years[1:])):
+        raise ValueError("school years must form a consecutive annual series")
 
     table = pd.DataFrame(index=raw.index)
     for field_name in ID_COLUMNS:
@@ -170,6 +203,8 @@ def load_attendance(source: Union[str, Path, IO[str]]) -> AttendanceData:
         else:
             table[field_name] = ""
     table["district_code"] = table["district_code"].str.upper()
+    if (table[["district_code", "student_group"]] == "").any().any():
+        raise ValueError("blank district code or student group")
     table.loc[table["district_name"] == "", "district_name"] = table["district_code"]
     # The published files leave Category blank on the "All Students" row.
     blank_cat = table["category"] == ""
@@ -181,29 +216,44 @@ def load_attendance(source: Union[str, Path, IO[str]]) -> AttendanceData:
         counts = _to_number(raw[year_map[(year, "count")]], f"{year} student count", report)
         rates = _to_number(raw[year_map[(year, "rate")]], f"{year} attendance rate", report)
 
-        finite = rates.dropna()
-        if len(finite) and finite.max() > _PERCENT_THRESHOLD:
+        marked = raw[year_map[(year, "rate")]].str.strip().str.endswith("%")
+        unmarked = rates[~marked].dropna()
+        unit = rate_unit
+        if unit == "auto":
+            # Invalid outliers must not rescale other observations.
+            candidates = unmarked[(unmarked >= 0) & (unmarked <= 100)]
+            if (candidates > 1).any() and ((candidates > 0) & (candidates <= 1)).any():
+                raise ValueError(f"ambiguous unmarked rate scales in {year}; specify rate_unit percent or fraction")
+            unit = "percent" if (candidates > _PERCENT_THRESHOLD).any() else "fraction"
+        if unit == "percent":
             rates = rates / 100.0
-            report.rate_scale[year] = "percent"
         else:
-            report.rate_scale[year] = "fraction"
+            rates.loc[marked] = rates.loc[marked] / 100.0
+        report.rate_scale[year] = unit + ("; explicit % cells" if marked.any() and unit == "fraction" else "")
 
         bad_rate = rates.notna() & ((rates < 0) | (rates > 1))
-        bad_count = counts.notna() & (counts < 0)
+        bad_count = counts.notna() & ((counts < 0) | (counts % 1 != 0))
         report.out_of_range_cells += int(bad_rate.sum() + bad_count.sum())
         rates[bad_rate] = np.nan
         counts[bad_count] = np.nan
 
         unpaired = counts.isna() ^ rates.isna()
-        report.unpaired_values_cleared += int(unpaired.sum())
-        counts[unpaired] = np.nan
-        rates[unpaired] = np.nan
+        if require_paired:
+            report.unpaired_values_cleared += int(unpaired.sum())
+            counts[unpaired] = np.nan
+            rates[unpaired] = np.nan
 
         table[count_col(year)] = counts
         table[rate_col(year)] = rates
 
+    if "reporting_period" in id_map:
+        table["_reporting_period"] = raw[id_map["reporting_period"]].str.strip()
     before = len(table)
-    table = table.drop_duplicates(subset=["district_code", "category", "student_group"], keep="first")
+    table = table.drop_duplicates()
+    keys = ["district_code", "category", "student_group"]
+    if table.duplicated(subset=keys, keep=False).any():
+        raise ValueError("conflicting observations for the same district and student group")
+    table = table.drop(columns=["_reporting_period"], errors="ignore")
     report.duplicate_rows_dropped = before - len(table)
     table = table.reset_index(drop=True)
     for year in years:
